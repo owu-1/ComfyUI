@@ -248,3 +248,42 @@ class LastLayer(nn.Module):
         x = (1 + scale[:, None, :]) * self.norm_final(x) + shift[:, None, :]
         x = self.linear(x)
         return x
+
+
+class Approximator(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int, n_layers=4, dtype=None, device=None, operations=None):
+        super().__init__()
+        self.in_proj = operations.Linear(in_dim, hidden_dim, bias=True, dtype=dtype, device=device)
+
+        self.layers = nn.ModuleList(
+            [
+                MLPEmbedder(
+                    in_dim=hidden_dim,
+                    hidden_dim=hidden_dim,
+                    dtype=dtype, device=device, operations=operations
+                )
+                for _ in range(n_layers)
+            ]
+        )
+
+        self.norms = nn.ModuleList(
+            [
+                RMSNorm(
+                    hidden_dim,
+                    dtype=dtype, device=device, operations=operations
+                )
+                for _ in range(n_layers)
+            ]
+        )
+
+        self.out_proj = operations.Linear(hidden_dim, out_dim, dtype=dtype, device=device)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.in_proj(x)
+
+        for layer, norms in zip(self.layers, self.norms):
+            x = x + layer(norms(x))
+
+        x = self.out_proj(x)
+
+        return x

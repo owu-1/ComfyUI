@@ -6,6 +6,8 @@ import torch
 from torch import Tensor, nn
 
 from .layers import (
+    Approximator,
+    ModulationOut,
     DoubleStreamBlock,
     EmbedND,
     LastLayer,
@@ -34,58 +36,6 @@ class FluxParams:
     patch_size: int
     qkv_bias: bool
     guidance_embed: bool
-
-
-class Approximator(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int, n_layers=4, dtype=None, device=None, operations=None):
-        super().__init__()
-        self.in_proj = operations.Linear(in_dim, hidden_dim, bias=True, dtype=dtype, device=device)
-
-        self.layers = nn.ModuleList(
-            [
-                MLPEmbedder(
-                    in_dim=hidden_dim,
-                    hidden_dim=hidden_dim,
-                    dtype=dtype, device=device, operations=operations
-                )
-                for x in range(n_layers)
-            ]
-        )
-
-        self.norms = nn.ModuleList(
-            [
-                RMSNorm(
-                    hidden_dim,
-                    dtype=dtype, device=device, operations=operations
-                )
-                for x in range(n_layers)
-            ]
-        )
-
-        self.out_proj = operations.Linear(hidden_dim, out_dim, dtype=dtype, device=device)
-
-    @property
-    def device(self):
-        # Get the device of the module (assumes all parameters are on the same device)
-        return next(self.parameters()).device
-
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.in_proj(x)
-
-        for layer, norms in zip(self.layers, self.norms):
-            x = x + layer(norms(x))
-
-        x = self.out_proj(x)
-
-        return x
-
-
-@dataclass
-class ModulationOut:
-    shift: Tensor
-    scale: Tensor
-    gate: Tensor
-
 
 class Flux(nn.Module):
     """
@@ -116,6 +66,7 @@ class Flux(nn.Module):
         # self.guidance_in = (
         #     MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size, dtype=dtype, device=device, operations=operations) if params.guidance_embed else nn.Identity()
         # )
+        self.mod_index_length = 344
         self.distilled_guidance_layer = Approximator(
             in_dim=64, out_dim=self.hidden_size, hidden_dim=5120, n_layers=5, dtype=dtype, device=device, operations=operations
         )  # n_layers hardcoded for v2!
@@ -252,18 +203,13 @@ class Flux(nn.Module):
 
         # vec = vec + self.vector_in(y[:,:self.params.vec_in_dim])
 
-        mod_index_length = 344
         distill_timestep = timestep_embedding(torch.tensor(timesteps), 16).to(img.dtype)
         distil_guidance = timestep_embedding(torch.tensor(guidance), 16).to(img.dtype)
         # get all modulation index
-        modulation_index = timestep_embedding(torch.arange(0, mod_index_length), 32).to(dtype=img.dtype, device=img.device)
-        # we need to broadcast the modulation index here so each batch has all of the index
-        modulation_index = modulation_index.unsqueeze(0).repeat(img.shape[0], 1, 1)
-        # and we need to broadcast timestep and guidance along too
-        timestep_guidance = torch.cat([distill_timestep, distil_guidance], dim=1).unsqueeze(1).repeat(1, mod_index_length, 1)
-        # then and only then we could concatenate it together
-        input_vec = torch.cat([timestep_guidance, modulation_index], dim=-1)
-
+        modulation_index = timestep_embedding(torch.arange(0, self.mod_index_length), 32).unsqueeze(0).to(dtype=img.dtype, device=img.device)
+        # broadcast timestep and guidance
+        timestep_guidance = torch.cat((distill_timestep, distil_guidance), dim=1).unsqueeze(1).expand(1, self.mod_index_length, 32)
+        input_vec = torch.cat((timestep_guidance, modulation_index), dim=-1)
         mod_vectors = self.distilled_guidance_layer(input_vec)
         mod_vectors_dict = self.distribute_modulations(mod_vectors)
 
