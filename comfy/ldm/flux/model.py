@@ -177,6 +177,14 @@ class Flux(nn.Module):
 
         return block_dict
 
+    def assert_dataclass(self, new, original):
+        print("shape", new.shift.shape, original.shift.shape)
+        assert torch.equal(new.shift, original.shift)
+        print("scale", new.scale.shape, original.scale.shape)
+        assert torch.equal(new.scale, original.scale)
+        print("gate", new.gate.shape, original.gate.shape)
+        assert torch.equal(new.gate, original.gate)
+
     def forward_orig(
         self,
         img: Tensor,
@@ -219,10 +227,41 @@ class Flux(nn.Module):
         pe = self.pe_embedder(ids)
 
         blocks_replace = patches_replace.get("dit", {})
+
+        def index_to_modulation_out(idx):
+            return ModulationOut(
+                shift=mod_vectors[:, idx+0:idx+1, :],
+                scale=mod_vectors[:, idx+1:idx+2, :],
+                gate=mod_vectors[:,  idx+2:idx+3, :]
+            )
+
+        offset_img_idx = (self.params.depth_single_blocks * 3)
+        offset_txt_idx = (self.params.depth_single_blocks * 3) + (self.params.depth * 3 * 2)
+
         for i, block in enumerate(self.double_blocks):
-            img_mod = mod_vectors_dict[f"double_blocks.{i}.img_mod.lin"]
-            txt_mod = mod_vectors_dict[f"double_blocks.{i}.txt_mod.lin"]
-            vec = [img_mod, txt_mod]
+            _img_mod = mod_vectors_dict[f"double_blocks.{i}.img_mod.lin"]
+            _txt_mod = mod_vectors_dict[f"double_blocks.{i}.txt_mod.lin"]
+            # vec = [img_mod, txt_mod]
+
+            img_idx = offset_img_idx + (i * 6)
+            img_mod = (
+                index_to_modulation_out(img_idx),
+                index_to_modulation_out(img_idx+3),
+            )
+
+            txt_idx = offset_txt_idx + (i * 6)
+            txt_mod = (
+                index_to_modulation_out(txt_idx),
+                index_to_modulation_out(txt_idx+3),
+            )
+
+            for j in range(2):
+                self.assert_dataclass(img_mod[j], _img_mod[j])
+
+            for j in range(2):
+                self.assert_dataclass(txt_mod[j], _txt_mod[j])
+
+            vec = (img_mod, txt_mod)
 
             if ("double_block", i) in blocks_replace:
                 def block_wrap(args):
@@ -246,7 +285,11 @@ class Flux(nn.Module):
         img = torch.cat((txt, img), 1)
 
         for i, block in enumerate(self.single_blocks):
-            vec = mod_vectors_dict[f"single_blocks.{i}.modulation.lin"]
+            _vec = mod_vectors_dict[f"single_blocks.{i}.modulation.lin"]
+
+            vec = index_to_modulation_out(i * 3)
+
+            self.assert_dataclass(vec, _vec)
 
             if ("single_block", i) in blocks_replace:
                 def block_wrap(args):
@@ -267,7 +310,18 @@ class Flux(nn.Module):
                         img[:, txt.shape[1] :, ...] += add
 
         img = img[:, txt.shape[1] :, ...]
-        vec = mod_vectors_dict["final_layer.adaLN_modulation.1"]
+
+        offset_idx = (self.params.depth_single_blocks * 3) + (self.params.depth * 3 * 2) * 2
+        vec = (
+            mod_vectors[:, offset_idx+0:offset_idx+1, :],
+            mod_vectors[:, offset_idx+1:offset_idx+2, :],
+        )
+
+        _vec = mod_vectors_dict["final_layer.adaLN_modulation.1"]
+
+        assert torch.equal(vec[0], _vec[0])
+        assert torch.equal(vec[1], _vec[1])
+
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
         return img
 
