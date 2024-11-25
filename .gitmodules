@@ -1,0 +1,3 @@
+[submodule "custom_nodes/ComfyUI_FluxMod"]
+	path = custom_nodes/ComfyUI_FluxMod
+	url = git@github.com:owu-1/ComfyUI_FluxMod.git

@@ -143,8 +143,7 @@ class DoubleStreamBlock(nn.Module):
         )
 
     def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor):
-        img_mod1, img_mod2 = self.img_mod(vec)
-        txt_mod1, txt_mod2 = self.txt_mod(vec)
+        (img_mod1, img_mod2), (txt_mod1, txt_mod2) = vec
 
         # prepare image for attention
         img_modulated = self.img_norm1(img)
@@ -218,7 +217,7 @@ class SingleStreamBlock(nn.Module):
         self.modulation = Modulation(hidden_size, double=False, dtype=dtype, device=device, operations=operations)
 
     def forward(self, x: Tensor, vec: Tensor, pe: Tensor) -> Tensor:
-        mod, _ = self.modulation(vec)
+        mod = vec
         x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
         qkv, mlp = torch.split(self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1)
 
@@ -243,7 +242,9 @@ class LastLayer(nn.Module):
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), operations.Linear(hidden_size, 2 * hidden_size, bias=True, dtype=dtype, device=device))
 
     def forward(self, x: Tensor, vec: Tensor) -> Tensor:
-        shift, scale = self.adaLN_modulation(vec).chunk(2, dim=1)
+        shift, scale = vec
+        shift = shift.squeeze(1)
+        scale = scale.squeeze(1)
         x = (1 + scale[:, None, :]) * self.norm_final(x) + shift[:, None, :]
         x = self.linear(x)
         return x
