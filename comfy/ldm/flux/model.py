@@ -61,11 +61,6 @@ class Flux(nn.Module):
         self.num_heads = params.num_heads
         self.pe_embedder = EmbedND(dim=pe_dim, theta=params.theta, axes_dim=params.axes_dim)
         self.img_in = operations.Linear(self.in_channels, self.hidden_size, bias=True, dtype=dtype, device=device)
-        # self.time_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size, dtype=dtype, device=device, operations=operations)
-        # self.vector_in = MLPEmbedder(params.vec_in_dim, self.hidden_size, dtype=dtype, device=device, operations=operations)
-        # self.guidance_in = (
-        #     MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size, dtype=dtype, device=device, operations=operations) if params.guidance_embed else nn.Identity()
-        # )
         self.mod_index_length = 344
         self.distilled_guidance_layer = Approximator(
             in_dim=64, out_dim=self.hidden_size, hidden_dim=5120, n_layers=5, dtype=dtype, device=device, operations=operations
@@ -95,96 +90,6 @@ class Flux(nn.Module):
         if final_layer:
             self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels, dtype=dtype, device=device, operations=operations)
 
-    @staticmethod
-    def distribute_modulations(tensor: torch.Tensor):
-        """
-        Distributes slices of the tensor into the block_dict as ModulationOut objects.
-
-        Args:
-            tensor (torch.Tensor): Input tensor with shape [batch_size, vectors, dim].
-        """
-        batch_size, vectors, dim = tensor.shape
-
-        block_dict = {}
-
-        # HARD CODED VALUES! lookup table for the generated vectors
-        # Add 38 single mod blocks
-        for i in range(38):
-            key = f"single_blocks.{i}.modulation.lin"
-            block_dict[key] = None
-
-        # Add 19 image double blocks
-        for i in range(19):
-            key = f"double_blocks.{i}.img_mod.lin"
-            block_dict[key] = None
-
-        # Add 19 text double blocks
-        for i in range(19):
-            key = f"double_blocks.{i}.txt_mod.lin"
-            block_dict[key] = None
-
-        # Add the final layer
-        block_dict["final_layer.adaLN_modulation.1"] = None
-
-
-        idx = 0  # Index to keep track of the vector slices
-
-        for key in block_dict.keys():
-            if "single_blocks" in key:
-                # Single block: 1 ModulationOut
-                block_dict[key] = ModulationOut(
-                    shift=tensor[:, idx:idx+1, :],
-                    scale=tensor[:, idx+1:idx+2, :],
-                    gate=tensor[:, idx+2:idx+3, :]
-                )
-                idx += 3  # Advance by 3 vectors
-
-            elif "img_mod" in key:
-                # Double block: List of 2 ModulationOut
-                double_block = []
-                for _ in range(2):  # Create 2 ModulationOut objects
-                    double_block.append(
-                        ModulationOut(
-                            shift=tensor[:, idx:idx+1, :],
-                            scale=tensor[:, idx+1:idx+2, :],
-                            gate=tensor[:, idx+2:idx+3, :]
-                        )
-                    )
-                    idx += 3  # Advance by 3 vectors per ModulationOut
-                block_dict[key] = double_block
-
-            elif "txt_mod" in key:
-                # Double block: List of 2 ModulationOut
-                double_block = []
-                for _ in range(2):  # Create 2 ModulationOut objects
-                    double_block.append(
-                        ModulationOut(
-                            shift=tensor[:, idx:idx+1, :],
-                            scale=tensor[:, idx+1:idx+2, :],
-                            gate=tensor[:, idx+2:idx+3, :]
-                        )
-                    )
-                    idx += 3  # Advance by 3 vectors per ModulationOut
-                block_dict[key] = double_block
-
-            elif "final_layer" in key:
-                # Final layer: 1 ModulationOut
-                block_dict[key] = [
-                    tensor[:, idx:idx+1, :],
-                    tensor[:, idx+1:idx+2, :],
-                ]
-                idx += 2  # Advance by 3 vectors
-
-        return block_dict
-
-    def assert_dataclass(self, new, original):
-        print("shape", new.shift.shape, original.shift.shape)
-        assert torch.equal(new.shift, original.shift)
-        print("scale", new.scale.shape, original.scale.shape)
-        assert torch.equal(new.scale, original.scale)
-        print("gate", new.gate.shape, original.gate.shape)
-        assert torch.equal(new.gate, original.gate)
-
     def forward_orig(
         self,
         img: Tensor,
@@ -203,23 +108,15 @@ class Flux(nn.Module):
 
         # running on sequences img
         img = self.img_in(img)
-        # vec = self.time_in(timestep_embedding(timesteps, 256).to(img.dtype))
-        # if self.params.guidance_embed:
-        #     if guidance is None:
-        #         raise ValueError("Didn't get guidance strength for guidance distilled model.")
-        #     vec = vec + self.guidance_in(timestep_embedding(guidance, 256).to(img.dtype))
 
-        # vec = vec + self.vector_in(y[:,:self.params.vec_in_dim])
-
-        distill_timestep = timestep_embedding(torch.tensor(timesteps), 16).to(img.dtype)
-        distil_guidance = timestep_embedding(torch.tensor(guidance), 16).to(img.dtype)
+        distill_timestep = timestep_embedding(timesteps, 16).to(img.dtype)
+        distil_guidance = timestep_embedding(guidance, 16).to(img.dtype)
         # get all modulation index
         modulation_index = timestep_embedding(torch.arange(0, self.mod_index_length), 32).unsqueeze(0).to(dtype=img.dtype, device=img.device)
         # broadcast timestep and guidance
         timestep_guidance = torch.cat((distill_timestep, distil_guidance), dim=1).unsqueeze(1).expand(1, self.mod_index_length, 32)
         input_vec = torch.cat((timestep_guidance, modulation_index), dim=-1)
         mod_vectors = self.distilled_guidance_layer(input_vec)
-        mod_vectors_dict = self.distribute_modulations(mod_vectors)
 
         txt = self.txt_in(txt)
 
@@ -239,10 +136,6 @@ class Flux(nn.Module):
         offset_txt_idx = (self.params.depth_single_blocks * 3) + (self.params.depth * 3 * 2)
 
         for i, block in enumerate(self.double_blocks):
-            _img_mod = mod_vectors_dict[f"double_blocks.{i}.img_mod.lin"]
-            _txt_mod = mod_vectors_dict[f"double_blocks.{i}.txt_mod.lin"]
-            # vec = [img_mod, txt_mod]
-
             img_idx = offset_img_idx + (i * 6)
             img_mod = (
                 index_to_modulation_out(img_idx),
@@ -254,12 +147,6 @@ class Flux(nn.Module):
                 index_to_modulation_out(txt_idx),
                 index_to_modulation_out(txt_idx+3),
             )
-
-            for j in range(2):
-                self.assert_dataclass(img_mod[j], _img_mod[j])
-
-            for j in range(2):
-                self.assert_dataclass(txt_mod[j], _txt_mod[j])
 
             vec = (img_mod, txt_mod)
 
@@ -285,11 +172,7 @@ class Flux(nn.Module):
         img = torch.cat((txt, img), 1)
 
         for i, block in enumerate(self.single_blocks):
-            _vec = mod_vectors_dict[f"single_blocks.{i}.modulation.lin"]
-
             vec = index_to_modulation_out(i * 3)
-
-            self.assert_dataclass(vec, _vec)
 
             if ("single_block", i) in blocks_replace:
                 def block_wrap(args):
@@ -316,11 +199,6 @@ class Flux(nn.Module):
             mod_vectors[:, offset_idx+0:offset_idx+1, :],
             mod_vectors[:, offset_idx+1:offset_idx+2, :],
         )
-
-        _vec = mod_vectors_dict["final_layer.adaLN_modulation.1"]
-
-        assert torch.equal(vec[0], _vec[0])
-        assert torch.equal(vec[1], _vec[1])
 
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
         return img

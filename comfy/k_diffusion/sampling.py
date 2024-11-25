@@ -11,6 +11,8 @@ from . import deis
 import comfy.model_patcher
 import comfy.model_sampling
 
+from torch.profiler import profile, ProfilerActivity
+
 def append_zero(x):
     return torch.cat([x, x.new_zeros([1])])
 
@@ -141,24 +143,39 @@ def sample_euler(model, x, sigmas, extra_args=None, callback=None, disable=None,
     """Implements Algorithm 2 (Euler steps) from Karras et al. (2022)."""
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
-    for i in trange(len(sigmas) - 1, disable=disable):
-        if s_churn > 0:
-            gamma = min(s_churn / (len(sigmas) - 1), 2 ** 0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.
-            sigma_hat = sigmas[i] * (gamma + 1)
-        else:
-            gamma = 0
-            sigma_hat = sigmas[i]
 
-        if gamma > 0:
-            eps = torch.randn_like(x) * s_noise
-            x = x + eps * (sigma_hat ** 2 - sigmas[i] ** 2) ** 0.5
-        denoised = model(x, sigma_hat * s_in, **extra_args)
-        d = to_d(x, sigma_hat, denoised)
-        if callback is not None:
-            callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigma_hat, 'denoised': denoised})
-        dt = sigmas[i + 1] - sigma_hat
-        # Euler method
-        x = x + d * dt
+    with profile(
+        activities=[
+            ProfilerActivity.CPU,
+            ProfilerActivity.CUDA
+        ],
+        schedule=torch.profiler.schedule(
+            wait=2,
+            warmup=3,
+            active=5,
+            repeat=2
+        ),
+        on_trace_ready=lambda prof : prof.export_chrome_trace(f'./trace_{prof.step_num}.json')
+    ) as prof:
+        for i in trange(len(sigmas) - 1, disable=disable):
+            if s_churn > 0:
+                gamma = min(s_churn / (len(sigmas) - 1), 2 ** 0.5 - 1) if s_tmin <= sigmas[i] <= s_tmax else 0.
+                sigma_hat = sigmas[i] * (gamma + 1)
+            else:
+                gamma = 0
+                sigma_hat = sigmas[i]
+
+            if gamma > 0:
+                eps = torch.randn_like(x) * s_noise
+                x = x + eps * (sigma_hat ** 2 - sigmas[i] ** 2) ** 0.5
+            denoised = model(x, sigma_hat * s_in, **extra_args)
+            d = to_d(x, sigma_hat, denoised)
+            if callback is not None:
+                callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigma_hat, 'denoised': denoised})
+            dt = sigmas[i + 1] - sigma_hat
+            # Euler method
+            x = x + d * dt
+            prof.step()
     return x
 
 
@@ -685,34 +702,20 @@ def sample_dpmpp_2m(model, x, sigmas, extra_args=None, callback=None, disable=No
     t_fn = lambda sigma: sigma.log().neg()
     old_denoised = None
 
-    from torch.profiler import profile, ProfilerActivity
-    with profile(
-        activities=[
-            ProfilerActivity.CPU,
-            ProfilerActivity.CUDA
-        ],
-        schedule=torch.profiler.schedule(
-            wait=2,
-            warmup=3,
-            active=5,
-            repeat=2
-        ),
-        on_trace_ready=lambda prof : prof.export_chrome_trace(f'./trace_{prof.step_num}.json')
-    ) as prof:
-        for i in trange(len(sigmas) - 1, disable=disable):
-            denoised = model(x, sigmas[i] * s_in, **extra_args)
-            if callback is not None:
-                callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigmas[i], 'denoised': denoised})
-            t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
-            h = t_next - t
-            if old_denoised is None or sigmas[i + 1] == 0:
-                x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised
-            else:
-                h_last = t - t_fn(sigmas[i - 1])
-                r = h_last / h
-                denoised_d = (1 + 1 / (2 * r)) * denoised - (1 / (2 * r)) * old_denoised
-                x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised_d
-            old_denoised = denoised
+    for i in trange(len(sigmas) - 1, disable=disable):
+        denoised = model(x, sigmas[i] * s_in, **extra_args)
+        if callback is not None:
+            callback({'x': x, 'i': i, 'sigma': sigmas[i], 'sigma_hat': sigmas[i], 'denoised': denoised})
+        t, t_next = t_fn(sigmas[i]), t_fn(sigmas[i + 1])
+        h = t_next - t
+        if old_denoised is None or sigmas[i + 1] == 0:
+            x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised
+        else:
+            h_last = t - t_fn(sigmas[i - 1])
+            r = h_last / h
+            denoised_d = (1 + 1 / (2 * r)) * denoised - (1 / (2 * r)) * old_denoised
+            x = (sigma_fn(t_next) / sigma_fn(t)) * x - (-h).expm1() * denoised_d
+        old_denoised = denoised
     return x
 
 @torch.no_grad()
